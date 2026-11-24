@@ -11,11 +11,13 @@ It uses series of packets through the tetronet along with SRTPv2 to tunnel the T
 I'm sure nobody is gonna use that thing, but there's an example of a config:\
 Server config:
 ```
+server
 <wsProvider>
 <targetIp>
 <targetPort>
 <verbose|unverbose>
 <virtual|ciocil>
+<watchdogRestartNoPackets>
 ```
 NOTE: if you use `virtual` modem option, you MUST specify a new RAWWS CIAS instead of the old socket.io one. All of my CIASes are using RAWWS, you can find URLs on other projects, but I recommend you to setup your own CIAS. I'm planning to cut speed for unknown people to a few Mbps so nobody will overload my dying server.
 Client config:
@@ -23,7 +25,7 @@ Client config:
 <wsProvider>
 <tetronetToInternetAddress>
 // leave this line empty
-<tcpPort>
+<tcpListenerPort>
 <verbose|unverbose>
 ```
 NOTE: This client does only support virtual modems in RAWWS mode. If you need to use LL-CIoCIL-mini, this is an open source project, you can implement it yourself ;)
@@ -35,6 +37,8 @@ NOTE: This client does only support virtual modems in RAWWS mode. If you need to
 - FTP
 - Firmware update
 - etc
+### What it can do
+Tbh it's not super fast. It's optimized, but not fast. This is technically NAT (Network Address Traversal) which is slow on its own. And this NAT is separated in 2 parts using a RAWWS connection, and this is a NAT running in a user-space. But it's pretty fast even on slow servers. But don't expect terabits per second. It can run minecraft, RDP and other stuff, video playback over HTTP and SSH remote access - this all works without lag. But if you want 10 Gbps this is not your choice.
 ### Contributing
 You can add features, but you don't be sad if i don't accept it. This is a bridge which the user will trust it's trafic. So unsafe/undocumented contributions will be revoked right away.
 ### Forks
@@ -42,4 +46,4 @@ Every fork you make must also be safe, since how i said, the user is trusting th
 ### Security
 I won't recommend you to use it with no encryption - tetronet nodes can see all of our packets if they really want to. I don't make logs, but who knows what others do. Use Https or Ssh over it. Be wiseful about choosing the endpoint. You can be not worried about somebody connecting to a "wrong" endpoint - the endpoint is one for all and nobody can change it remotely, only by accessing the TTOI-TCP side.
 ### Btw
-This project is older than the UDP bridge. But then it got abandoned until i made SRTPv1 and then claude code made SRTPv2, so now it works as intended and never does packet loss.
+This project is older than the UDP bridge. But then it got abandoned until i made SRTPv1 and then claude code made SRTPv2, so now it works as intended and never does packet loss (hopefully).
