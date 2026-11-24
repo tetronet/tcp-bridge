@@ -1,7 +1,9 @@
 ﻿using ModemAPI;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.WebSockets;
 
 Console.WriteLine("TCP-Bridge v1.1 (Optimized for Tetronet)");
 
@@ -22,6 +24,14 @@ string wsProvider = config[1];
 IPAddress targetAddress = IPAddress.Parse(config[2]);
 int targetPort = int.Parse(config[3]);
 bool verbose = config[4] == "verbose";
+// 7-я строка (необязательная): через сколько минут без единого пакета из Тетронета завершить процесс,
+// чтобы его перезапустил systemd/скрипт. Пусто или 0 — не завершать.
+int watchdogMinutes = config.Length > 6 && int.TryParse(config[6], out int wd) ? wd : 0;
+// Размер одного сообщения SRTP — максимальный. Каждое сообщение в Тетронете — отдельный кадр JSON+base64, и почти вся нагрузка
+// на процессор (пробуждение потоков, разбор JSON, системные вызовы, подтверждения) растёт с числом сообщений, а не байт.
+// Роутер не пропускает package_data от 87385 символов; ModemAPI больше не экранирует "+", так что base64 максимального
+// сообщения всегда 80000 символов.
+const int ChunkSize = SRTPClient.MaxMessageLength;
 
 void DebugOutput(object d)
 {
@@ -58,6 +68,53 @@ else
 {
     throw new FormatException("sixth line of the config must be \"virtual\" for tetronet over socket.io or \"ciocil\" for tetronet over serial (LL-CIoCIL-mini)");
 }
+if (modem is VirtualModem virtualModem)
+{
+    // ModemAPI молча повторяет подключение каждые 2 секунды и не показывает ошибку: выводим это сами
+    long reconnectStartedAt = 0;
+    int reconnectAttempts = 0;
+    virtualModem.OnReconnectWebsocket += delegate ()
+    {
+        int attempt = Interlocked.Increment(ref reconnectAttempts);
+        if (attempt == 1)
+        {
+            reconnectStartedAt = Stopwatch.GetTimestamp();
+            Console.WriteLine($"[WARNING]: [{DateTime.Now:G}] Connection to {wsProvider} lost, reconnecting...");
+        }
+        // примерно через 6 секунд, а потом раз в 5 минут, узнаём настоящую причину
+        if (attempt == 3 || attempt % 150 == 0)
+        {
+            Console.WriteLine($"[WARNING]: [{DateTime.Now:G}] Still reconnecting (attempt {attempt}), checking why...");
+            _ = ProbeConnectionAsync();
+        }
+    };
+    virtualModem.OnSuccessReconnectWebsocket += delegate ()
+    {
+        int attempts = Interlocked.Exchange(ref reconnectAttempts, 0);
+        Console.WriteLine($"[INFO]: [{DateTime.Now:G}] Reconnected to {wsProvider} after {Stopwatch.GetElapsedTime(reconnectStartedAt).TotalSeconds:F0}s ({attempts} attempts)");
+    };
+}
+
+async Task ProbeConnectionAsync()
+{
+    using ClientWebSocket probe = new();
+    using CancellationTokenSource cts = new(TimeSpan.FromSeconds(15));
+    try
+    {
+        await probe.ConnectAsync(new Uri(wsProvider), cts.Token);
+        Console.WriteLine($"[INFO]: Test connection to {wsProvider} succeeded, the server is reachable");
+        probe.Abort();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[ERROR]: Test connection to {wsProvider} failed:");
+        for (Exception? e = ex; e != null; e = e.InnerException)
+        {
+            Console.WriteLine($"         {e.GetType().Name}: {e.Message}");
+        }
+    }
+}
+
 modem.Dial();
 Console.Write("[PROCESS]: Connecting");
 while (!modem.IsModemConnected)
@@ -71,10 +128,13 @@ File.WriteAllText("ci_address.txt", modem.LocalModemAddress.AddressValue);
 
 // ConnectionID -> TCP-клиент + SRTP-клиент + адрес в Тетронете
 ConcurrentDictionary<uint, BridgeConnection> connections = new();
+// Environment.TickCount64, а не Stopwatch: обновляется на каждый принятый пакет, а точность до миллисекунды тут не нужна
+long lastPacketTimestamp = Environment.TickCount64;
 
 modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
 {
     // Этот обработчик вызывается прямо из цикла приёма модема: здесь нельзя ничего блокировать.
+    Volatile.Write(ref lastPacketTimestamp, Environment.TickCount64);
     if (verbose)
     {
         DebugOutput($"[INFO]: Type: {received.QueryType}");
@@ -84,6 +144,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
 
     if (received.QueryType == "ping")
     {
+        ushort ttl = received.RoutersToPass;
         _ = Task.Run(delegate ()
         {
             try
@@ -92,7 +153,7 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet received, Action k)
                 byte[] pingData = new byte[Random.Shared.Next(1, 30000)];
                 Random.Shared.NextBytes(pingData);
                 modem.Transmit(pingData, received.Transmitter, "pong", received.ConnectionID, null, 30000);
-                Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID})");
+                Console.WriteLine($"[EVENT]: Response for client's ping packet (ping connection id is {received.ConnectionID}, TTL is {ttl})");
             }
             catch
             {
@@ -150,8 +211,7 @@ void RunConnection(BridgeConnection conn)
         }
 
         NetworkStream stream = conn.Tcp.GetStream();
-        // Крупные пакеты: каждый пакет в Тетронете — отдельное JSON+base64 сообщение со своими накладными расходами
-        byte[] buffer = new byte[32768];
+        byte[] buffer = new byte[ChunkSize];
         while (conn.Closed == 0)
         {
             int bytesRead = stream.Read(buffer, 0, buffer.Length);
@@ -163,6 +223,7 @@ void RunConnection(BridgeConnection conn)
                 srtp.WaitForAcknowledgements();
                 break;
             }
+            bytesRead += ReadAvailable(conn.Tcp, buffer, bytesRead);
             if (verbose) DebugOutput("[PROCESS]: Transmitting TCP segment...");
             srtp.Transmit(buffer[..bytesRead]);
             if (verbose) DebugOutput($"[EVENT]: Transmitted TCP segment of {bytesRead} bytes from {conn.Id} to Tetronet");
@@ -199,6 +260,23 @@ void FromTetronetToTcpSocket(SRTPClient sender, byte[] data)
     }
 }
 
+// Дочитывает то, что уже пришло в сокет, не дожидаясь новых данных: одно сообщение SRTP вместо нескольких мелких
+// при той же задержке. Конец потока (Read вернул 0) здесь не обрабатывается — его увидит следующий Read в цикле.
+static int ReadAvailable(TcpClient tcp, byte[] buffer, int offset)
+{
+    int added = 0;
+    while (offset + added < buffer.Length && tcp.Available > 0)
+    {
+        int more = tcp.GetStream().Read(buffer, offset + added, buffer.Length - offset - added);
+        if (more == 0)
+        {
+            break;
+        }
+        added += more;
+    }
+    return added;
+}
+
 void CloseConnection(BridgeConnection conn, bool notifyRemote)
 {
     // Закрываем ровно один раз, даже если сюда одновременно пришли несколько потоков
@@ -227,14 +305,46 @@ void CloseConnection(BridgeConnection conn, bool notifyRemote)
     Console.WriteLine($"[INFO]: Connection {conn.Id} cleaned up");
 }
 
+// Цикл работает на главном потоке, а не в пуле: если пул потоков встанет, статус и watchdog всё равно сработают
 int lastCount = -1;
+string? lastAddress = modem.LocalModemAddress?.AddressValue;
+long lastStatusTimestamp = Stopwatch.GetTimestamp();
 while (true)
 {
-    await Task.Delay(5000);
+    Thread.Sleep(5000);
     if (connections.Count != lastCount)
     {
         lastCount = connections.Count;
         Console.WriteLine($"[STATUS]: Active TCP connections: {lastCount}");
+    }
+
+    // Вышестоящий узел может выдать другой адрес после переподключения, и клиенты перестанут нас находить
+    string? address = modem.LocalModemAddress?.AddressValue;
+    if (address != lastAddress)
+    {
+        Console.WriteLine($"[WARNING]: [{DateTime.Now:G}] Tetronet address changed from {lastAddress} to {address}, clients must use the new one");
+        lastAddress = address;
+        if (address != null)
+        {
+            try { File.WriteAllText("ci_address.txt", address); } catch { }
+        }
+    }
+
+    TimeSpan silence = TimeSpan.FromMilliseconds(Environment.TickCount64 - Volatile.Read(ref lastPacketTimestamp));
+    if (Stopwatch.GetElapsedTime(lastStatusTimestamp) >= TimeSpan.FromMinutes(10))
+    {
+        lastStatusTimestamp = Stopwatch.GetTimestamp();
+        Console.WriteLine($"[STATUS]: [{DateTime.Now:G}] connected={modem.IsModemConnected}, address={address}, " +
+            $"last packet {silence.TotalSeconds:F0}s ago, connections={connections.Count}, " +
+            $"pool threads={ThreadPool.ThreadCount}, queued work={ThreadPool.PendingWorkItemCount}, " +
+            $"memory={Environment.WorkingSet / 1048576}MB");
+    }
+
+    if (watchdogMinutes > 0 && silence > TimeSpan.FromMinutes(watchdogMinutes))
+    {
+        Console.WriteLine($"[ERROR]: [{DateTime.Now:G}] No packets from tetronet for {silence.TotalMinutes:F0} minutes " +
+            $"(connected={modem.IsModemConnected}, queued work={ThreadPool.PendingWorkItemCount}), exiting so the bridge can be restarted");
+        Environment.Exit(3);
     }
 }
 

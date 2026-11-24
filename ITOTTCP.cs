@@ -5,6 +5,11 @@ using System.Net.Sockets;
 
 string[] config = File.ReadAllLines("config.txt");
 bool verbose = config.Length > 4 && config[4] == "verbose";
+// Размер одного сообщения SRTP — максимальный. Каждое сообщение в Тетронете — отдельный кадр JSON+base64, и почти вся нагрузка
+// на процессор (пробуждение потоков, разбор JSON, системные вызовы, подтверждения) растёт с числом сообщений, а не байт.
+// Роутер не пропускает package_data от 87385 символов; ModemAPI больше не экранирует "+", так что base64 максимального
+// сообщения всегда 80000 символов.
+const int ChunkSize = SRTPClient.MaxMessageLength;
 
 // ModemAPI делает много синхронных ожиданий (SendAsync().Wait(), Thread.Sleep в SRTPClient.Transmit),
 // поэтому даём пулу потоков запас, чтобы он не "задыхался" при нескольких активных соединениях.
@@ -39,6 +44,7 @@ Console.WriteLine("Listening on port " + int.Parse(config[3]));
 ConcurrentDictionary<uint, ClientConnection> connections = new();
 
 uint currentPing = 0;
+ConcurrentDictionary<uint, long> pendingPings = []; // ping connection ID -> timestamp
 
 _ = Task.Run(async delegate ()
 {
@@ -46,12 +52,23 @@ _ = Task.Run(async delegate ()
     {
         try
         {
+            Console.WriteLine($"Ping sent with Connection ID of {currentPing}");
+            pendingPings[currentPing] = DateTime.Now.Ticks;
             modem.Transmit([0x00], gateway, "ping", currentPing);
-            Console.WriteLine("Ping sent with Connection ID of " + currentPing);
         }
-        catch (Exception ex)
+        catch
         {
-            Console.WriteLine($"Failed to transmit ping #{currentPing}: {ex.Message}");
+            pendingPings.TryRemove(currentPing, out _);
+            Console.WriteLine("Failed to transmit ping: refused");
+        }
+        // Понги на потерянные пинги не придут: не даём словарю расти бесконечно
+        long staleBefore = DateTime.Now.Ticks - TimeSpan.TicksPerMinute;
+        foreach (var kv in pendingPings)
+        {
+            if (kv.Value < staleBefore)
+            {
+                pendingPings.TryRemove(kv.Key, out _);
+            }
         }
         currentPing++;
         await Task.Delay(10000);
@@ -63,7 +80,10 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
     // Этот обработчик вызывается прямо из цикла приёма модема: здесь нельзя ничего блокировать.
     if (p.QueryType == "pong")
     {
-        Console.WriteLine($"Pong received for Connection ID {p.ConnectionID}");
+        if (pendingPings.TryRemove(p.ConnectionID, out long pingTimestamp))
+        {
+            Console.WriteLine($"Pong received with Connection ID of {p.ConnectionID} in {(DateTime.Now.Ticks - pingTimestamp) / 10000m}ms");
+        }
     }
     else if (p.QueryType == "tcp_reset" && p.Transmitter.AddressValue == gateway.AddressValue)
     {
@@ -78,6 +98,23 @@ modem.AttachReceiveEventNoUnfragment(delegate (Packet p, Action k)
         }
     }
 });
+
+// Дочитывает то, что уже пришло в сокет, не дожидаясь новых данных: одно сообщение SRTP вместо нескольких мелких
+// при той же задержке. Конец потока (Read вернул 0) здесь не обрабатывается — его увидит следующий Read в цикле.
+static int ReadAvailable(TcpClient tcp, byte[] buffer, int offset)
+{
+    int added = 0;
+    while (offset + added < buffer.Length && tcp.Available > 0)
+    {
+        int more = tcp.GetStream().Read(buffer, offset + added, buffer.Length - offset - added);
+        if (more == 0)
+        {
+            break;
+        }
+        added += more;
+    }
+    return added;
+}
 
 void CloseConnection(ClientConnection conn, bool notifyRemote)
 {
@@ -207,8 +244,7 @@ void HandleClient(ClientConnection conn)
         });
 
         NetworkStream stream = conn.Tcp.GetStream();
-        // Крупные пакеты: каждый пакет в Тетронете — отдельное JSON+base64 сообщение со своими накладными расходами
-        byte[] buffer = new byte[32768];
+        byte[] buffer = new byte[ChunkSize];
         while (conn.Closed == 0)
         {
             int bytesRead = stream.Read(buffer, 0, buffer.Length);
@@ -219,6 +255,7 @@ void HandleClient(ClientConnection conn)
                 tetronetClient.WaitForAcknowledgements();
                 break;
             }
+            bytesRead += ReadAvailable(conn.Tcp, buffer, bytesRead);
             tetronetClient.Transmit(buffer[..bytesRead]);
             if (verbose) DebugOutput($"Transmitted {bytesRead} bytes to Tetronet (conn {conn.Id})");
         }
